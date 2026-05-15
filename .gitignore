@@ -11,5 +11,10 @@ j
 google_play_service_account.json
 junk/
 old/
+cookies.txt
+login.sh
+pricing
+scripts/req.txt
+scripts/trial_credits.sh
 scripts/image_sample.log
 scripts/image_samples/

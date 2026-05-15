@@ -320,7 +320,31 @@ class Discuss(db.Model):
     __table_args__ = (
         db.Index("ix_discuss_dream_created", "dream_id", "created_at"),
     )
-    
+
+
+class DreamInsight(db.Model):
+    __tablename__ = "dream_insight"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    generated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    window_start = db.Column(db.DateTime, nullable=False)
+    window_end = db.Column(db.DateTime, nullable=False)
+    dream_count = db.Column(db.Integer, nullable=False)
+
+    narrative = db.Column(db.Text, nullable=False)
+    symbols = db.Column(db.Text, nullable=False, default="[]")     # JSON-encoded list
+    themes = db.Column(db.Text, nullable=False, default="[]")
+    patterns = db.Column(db.Text, nullable=False, default="[]")
+    questions = db.Column(db.Text, nullable=False, default="[]")
+
+    model = db.Column(db.String(64), nullable=True)
+    prompt_version = db.Column(db.Integer, nullable=False, default=1)
+
+    __table_args__ = (
+        db.Index("ix_dream_insight_user_generated", "user_id", "generated_at"),
+    )
+
 
 class LifeEvent(db.Model):
     __tablename__ = "life_event"
@@ -4756,6 +4780,289 @@ def admin_set_password(user_id: int):
     except Exception:
         db.session.rollback()
         return _admin_redirect(user_id, "Failed to update password")
+
+
+# =====================================================================
+# Deep Insights — across-dreams AI analysis
+# =====================================================================
+
+# Eligibility / cadence knobs. Keep these in one place so the cron and the
+# refresh endpoint stay in agreement.
+MIN_DREAMS_FOR_INSIGHTS = 10
+MIN_DAYS_BETWEEN_AUTO_INSIGHTS = 7
+MIN_NEW_DREAMS_FOR_REGEN = 3
+MAX_DREAMS_IN_DIGEST = 50
+INSIGHTS_PROMPT_VERSION = 1
+INSIGHTS_MODEL = "gpt-4o"
+
+
+def _truncate(text, limit):
+    if not text:
+        return ""
+    s = str(text).strip().replace("\r\n", "\n").replace("\n\n", "\n")
+    if len(s) > limit:
+        return s[: limit - 1].rstrip() + "…"
+    return s
+
+
+def build_dream_digest(dreams):
+    """Render a chronological digest the AI can reason about.
+
+    Each entry is intentionally compact — summary + tone + a short excerpt
+    of the prior per-dream analysis and any user notes. Sending raw dream
+    text for every dream blows the budget without improving the result.
+    """
+    lines = []
+    for idx, d in enumerate(dreams, start=1):
+        when = d.created_at.strftime("%Y-%m-%d") if d.created_at else "unknown"
+        tone = (d.tone or "").strip() or "unspecified"
+        summary = _truncate(d.summary, 200) or "(no summary)"
+        analysis_excerpt = _truncate(d.analysis, 280)
+        notes = _truncate(d.notes, 180)
+
+        block = [f"[Dream #{idx} — {when} — tone: {tone}]"]
+        block.append(f"Summary: {summary}")
+        if analysis_excerpt:
+            block.append(f"Prior AI analysis (excerpt): {analysis_excerpt}")
+        if notes:
+            block.append(f"User notes: {notes}")
+        lines.append("\n".join(block))
+
+    return "\n\n".join(lines)
+
+
+def _validate_insights_payload(raw):
+    """Returns (ok, parsed_or_error_message). Strict but forgiving on shape."""
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        return False, f"Could not parse JSON: {e}"
+
+    if not isinstance(data, dict):
+        return False, "Top-level must be an object"
+
+    narrative = data.get("narrative")
+    if not isinstance(narrative, str) or not narrative.strip():
+        return False, "narrative missing or empty"
+
+    for key in ("recurring_symbols", "emotional_throughlines", "patterns", "questions_to_sit_with"):
+        if not isinstance(data.get(key), list):
+            return False, f"{key} must be a list"
+
+    return True, data
+
+
+def _eligibility_for_user(user_id):
+    """Returns a dict describing whether the user is eligible for insights."""
+    total = Dream.query.filter_by(user_id=user_id, hidden=False).count()
+    if total < MIN_DREAMS_FOR_INSIGHTS:
+        return {
+            "ok": False,
+            "reason": "not_enough_dreams",
+            "dreams_required": MIN_DREAMS_FOR_INSIGHTS,
+            "current": total,
+        }
+    return {"ok": True, "current": total}
+
+
+def _utc_iso(dt):
+    """Emit an ISO-8601 timestamp with an explicit UTC offset.
+
+    DreamInsight datetimes are stored as naive UTC (datetime.utcnow). Without
+    an offset, the client parses them as local time, which shifts relative
+    timestamps by the user's UTC offset. Tagging them as UTC fixes that.
+    """
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc).isoformat()
+
+
+def _serialize_insight(rec):
+    return {
+        "id": rec.id,
+        "generated_at": _utc_iso(rec.generated_at),
+        "window_start": _utc_iso(rec.window_start),
+        "window_end": _utc_iso(rec.window_end),
+        "dream_count": rec.dream_count,
+        "narrative": rec.narrative or "",
+        "symbols": json.loads(rec.symbols or "[]"),
+        "themes": json.loads(rec.themes or "[]"),
+        "patterns": json.loads(rec.patterns or "[]"),
+        "questions": json.loads(rec.questions or "[]"),
+        "model": rec.model,
+        "prompt_version": rec.prompt_version,
+    }
+
+
+def generate_deep_insights_for_user(user_id, *, force=False):
+    """Build a digest, call the AI, validate, and persist a DreamInsight row.
+
+    Returns (status, payload):
+      - ("ok", DreamInsight) on success
+      - ("locked", {...}) if user doesn't meet eligibility
+      - ("skipped", reason_str) if eligible but doesn't need regeneration yet
+      - ("error", reason_str) on AI / validation failure
+    """
+    eligibility = _eligibility_for_user(user_id)
+    if not eligibility["ok"]:
+        return "locked", eligibility
+
+    last = (
+        DreamInsight.query.filter_by(user_id=user_id)
+        .order_by(DreamInsight.generated_at.desc())
+        .first()
+    )
+
+    if last and not force:
+        days_since = (datetime.utcnow() - last.generated_at).days
+        new_dreams_since = Dream.query.filter(
+            Dream.user_id == user_id,
+            Dream.hidden == False,  # noqa: E712
+            Dream.created_at > last.generated_at,
+        ).count()
+        if days_since < MIN_DAYS_BETWEEN_AUTO_INSIGHTS or new_dreams_since < MIN_NEW_DREAMS_FOR_REGEN:
+            return "skipped", f"days_since={days_since}, new_dreams={new_dreams_since}"
+
+    dreams = (
+        Dream.query.filter_by(user_id=user_id, hidden=False)
+        .order_by(Dream.created_at.desc())
+        .limit(MAX_DREAMS_IN_DIGEST)
+        .all()
+    )
+    # Reverse to chronological (oldest -> newest) for the model.
+    dreams = list(reversed(dreams))
+    if not dreams:
+        return "locked", {"ok": False, "reason": "no_dreams"}
+
+    window_start = dreams[0].created_at
+    window_end = dreams[-1].created_at
+
+    user = User.query.get(user_id)
+    name = (user.first_name or "this dreamer").strip() if user else "this dreamer"
+
+    digest = build_dream_digest(dreams)
+    system_prompt = CATEGORY_PROMPTS["deep_insights"]
+    user_prompt = (
+        f"Here is the dream journal of {name}, covering {len(dreams)} dreams "
+        f"between {window_start.strftime('%Y-%m-%d')} and {window_end.strftime('%Y-%m-%d')}.\n\n"
+        f"{digest}\n\n"
+        "Respond with valid JSON only, matching the shape described in the system prompt."
+    )
+
+    try:
+        response = openai.chat.completions.create(
+            model=INSIGHTS_MODEL,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    except Exception as e:
+        logger.error(f"[insights] OpenAI call failed for user {user_id}: {e}")
+        return "error", f"openai_call_failed: {e}"
+
+    if not getattr(response, "choices", None) or not response.choices[0].message:
+        return "error", "empty_response"
+
+    raw = response.choices[0].message.content
+    ok, parsed = _validate_insights_payload(raw)
+    if not ok:
+        logger.error(f"[insights] Invalid JSON from model for user {user_id}: {parsed}")
+        return "error", f"invalid_json: {parsed}"
+
+    rec = DreamInsight(
+        user_id=user_id,
+        generated_at=datetime.utcnow(),
+        window_start=window_start,
+        window_end=window_end,
+        dream_count=len(dreams),
+        narrative=parsed["narrative"].strip(),
+        symbols=json.dumps(parsed.get("recurring_symbols", [])),
+        themes=json.dumps(parsed.get("emotional_throughlines", [])),
+        patterns=json.dumps(parsed.get("patterns", [])),
+        questions=json.dumps(parsed.get("questions_to_sit_with", [])),
+        model=INSIGHTS_MODEL,
+        prompt_version=INSIGHTS_PROMPT_VERSION,
+    )
+    try:
+        db.session.add(rec)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"[insights] Failed to persist for user {user_id}: {e}")
+        return "error", f"persist_failed: {e}"
+
+    return "ok", rec
+
+
+@app.route("/api/insights", methods=["GET"])
+@login_required
+def get_latest_insights():
+    """Return the most recent DreamInsight for the current user.
+
+    Response shapes:
+      - 200 { "locked": true, "dreams_required": 10, "current": N }
+      - 200 { "locked": false, "insight": null }            (eligible, none yet)
+      - 200 { "locked": false, "insight": {...full payload...} }
+    """
+    eligibility = _eligibility_for_user(current_user.id)
+    if not eligibility["ok"]:
+        return jsonify({
+            "locked": True,
+            "dreams_required": eligibility["dreams_required"],
+            "current": eligibility["current"],
+        }), 200
+
+    rec = (
+        DreamInsight.query.filter_by(user_id=current_user.id)
+        .order_by(DreamInsight.generated_at.desc())
+        .first()
+    )
+    return jsonify({
+        "locked": False,
+        "insight": _serialize_insight(rec) if rec else None,
+    }), 200
+
+
+@app.route("/api/insights/refresh", methods=["POST"])
+@login_required
+def refresh_insights():
+    """Force-generate a fresh DreamInsight. Pro-only to avoid abuse.
+
+    Returns:
+      - 200 { "insight": {...} } on success
+      - 200 { "locked": true, ... } if user is below the dream threshold
+      - 402 if user is not pro
+      - 429 if regenerated too recently (1 per hour cap)
+      - 502 if the AI call or validation failed
+    """
+    if not _user_is_pro(current_user.id):
+        return jsonify({"error": "pro_required"}), 402
+
+    # 1-per-hour throttle on manual refresh.
+    recent = (
+        DreamInsight.query.filter_by(user_id=current_user.id)
+        .order_by(DreamInsight.generated_at.desc())
+        .first()
+    )
+    if recent and (datetime.utcnow() - recent.generated_at) < timedelta(hours=1):
+        return jsonify({
+            "error": "rate_limited",
+            "retry_after_seconds": 3600 - int((datetime.utcnow() - recent.generated_at).total_seconds()),
+        }), 429
+
+    status, payload = generate_deep_insights_for_user(current_user.id, force=True)
+    if status == "ok":
+        return jsonify({"locked": False, "insight": _serialize_insight(payload)}), 200
+    if status == "locked":
+        return jsonify({
+            "locked": True,
+            "dreams_required": payload.get("dreams_required", MIN_DREAMS_FOR_INSIGHTS),
+            "current": payload.get("current", 0),
+        }), 200
+    # "error" or unexpected
+    return jsonify({"error": "generation_failed", "detail": str(payload)}), 502
 
 
 if __name__ == "__main__":
