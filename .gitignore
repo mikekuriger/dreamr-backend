@@ -5,6 +5,7 @@ todo
 static
 getlog
 dreamr.log
+dreamr.log.*
 Untitled*
 google_oauth_credentials.json
 j
@@ -13,8 +14,10 @@ junk/
 old/
 cookies.txt
 login.sh
+reports.test.sh
 pricing
 scripts/req.txt
 scripts/trial_credits.sh
 scripts/image_sample.log
 scripts/image_samples/
+backups/

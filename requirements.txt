@@ -17,6 +17,17 @@ google-auth~=2.0
 google-auth-oauthlib~=1.2
 PyJWT[crypto]~=2.9
 
+# Apple App Store Server Notifications V2 / Server API.
+# Pin >=3.1.2: 3.1.1 and earlier have a disclosed OCSP-bypass issue
+# (GHSA-8f6j-263m-g72x) that lets SignedDataVerifier accept stale
+# revoked-cert checks. Pin attrs/cryptography too — left unpinned, pip
+# resolves a newer pyOpenSSL that drags in cryptography 50.x, an upgrade
+# well beyond what the rest of the app (Authlib, PyJWT[crypto], google-auth,
+# bcrypt) has been run against.
+app-store-server-library==3.1.2
+attrs~=25.3
+cryptography~=45.0
+
 # AI / images
 openai~=1.0
 Pillow~=10.4

@@ -20,6 +20,9 @@ from openai import OpenAI
 from PIL import Image
 from PIL import ImageFilter
 from prompts import CATEGORY_PROMPTS, TONE_TO_STYLE
+import apple_notifications
+from appstoreserverlibrary.signed_data_verifier import VerificationException as AppleVerificationException
+import moderation
 from quota import ensure_week_current, next_reset_iso, get_or_create_credits
 from quota import decrement_text_or_deny, refund_text
 from quota import decrement_image_or_deny, refund_image
@@ -106,18 +109,41 @@ APPLE_CLIENT_ID = os.getenv("APPLE_CLIENT_ID") or APPLE_BUNDLE_ID
 
 _apple_jwk_client = PyJWKClient(APPLE_JWKS_URL)
 
-# apple store (bottom of page https://appstoreconnect.apple.com/apps/6747240349/distribution/info)
-# @app.post("/appstore/notifications")
-# def appstore_notifications():
-#     data = request.get_json(force=True, silent=True)
-#     # For v2, payload is usually in data["signedPayload"] (string JWS)
-#     # TODO: verify JWS using Apple JWKS, then decode claims
-#     # TODO: handle notificationType/subtype and update your DB
-#     return jsonify({"status": "ok"}), 200
+# App Store Server Notifications V2. Register this SAME url for both the
+# "Production Server URL" and "Sandbox Server URL" fields in App Store
+# Connect (bottom of https://appstoreconnect.apple.com/apps/6747240349/distribution/info)
+# — every notification carries its own environment, and apple_notifications
+# picks the matching verifier per-request, so one endpoint handles both.
+@app.post("/appstore/notifications")
+def appstore_notifications():
+    body = request.get_json(force=True, silent=True) or {}
+    signed_payload = body.get("signedPayload")
+    if not signed_payload:
+        logger.warning("[apple_notifications] POST with no signedPayload: %r", body)
+        return jsonify({"status": "bad_request"}), 400
 
-# @app.post("/appstore/notifications-sandbox")
-# def appstore_notifications_sbx():
-#     return jsonify({"status": "ok"}), 200
+    try:
+        result = apple_notifications.handle_notification(
+            app, db, UserSubscription, AppleNotificationEvent, signed_payload
+        )
+    except AppleVerificationException as e:
+        # Either misconfigured (wrong bundle id / app apple id / missing
+        # root cert) or the payload didn't come from Apple. Either way we
+        # must not report success. Log with enough detail to tell those
+        # apart, but never log the payload itself.
+        logger.error("[apple_notifications] verification failed: status=%s", e.status)
+        return jsonify({"status": "verification_failed"}), 400
+    except apple_notifications.AppleNotificationConfig as e:
+        logger.error("[apple_notifications] not configured: %s", e)
+        return jsonify({"status": "not_configured"}), 500
+    except Exception:
+        db.session.rollback()
+        logger.exception("[apple_notifications] unexpected error processing notification")
+        # 5xx (not 2xx) so Apple retries later instead of us silently
+        # dropping the event on a transient failure (DB hiccup, etc.).
+        return jsonify({"status": "error"}), 500
+
+    return jsonify({"status": "ok", **result}), 200
 
 
 # --- Admin config ---
@@ -367,6 +393,44 @@ class LifeEvent(db.Model):
     def __repr__(self):
         return f"<LifeEvent id={self.id} user_id={self.user_id} title={self.title!r}>"
 
+
+class ContentReport(db.Model):
+    """User-submitted report flagging AI-generated content as offensive.
+
+    Required by Google Play's AI-Generated Content policy: users must be
+    able to flag offensive AI output from within the app, and developers
+    must use those reports to inform moderation. Reports here are
+    reviewed by an admin; the client hides flagged content from the
+    reporter immediately so they don't see it again.
+    """
+    __tablename__ = "content_report"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    # What was reported: "analysis", "image", "insight", "discuss", "other"
+    content_type = db.Column(db.String(32), nullable=False)
+    # Free-form pointer to the source row (dream id, discuss id, insight id).
+    # String avoids coupling to a single FK target.
+    content_id = db.Column(db.String(64), nullable=True, index=True)
+    # User-selected reason
+    category = db.Column(db.String(32), nullable=False)
+    comment = db.Column(db.Text, nullable=True)
+    # Snapshot of what the user actually saw, capped client-side at 2KB.
+    # Survives even if the underlying record gets edited or deleted.
+    content_snapshot = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    # Review workflow: "open", "reviewing", "actioned", "dismissed"
+    status = db.Column(db.String(16), nullable=False, default="open")
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    action = db.Column(db.String(64), nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<ContentReport id={self.id} user_id={self.user_id} "
+            f"type={self.content_type} cat={self.category} status={self.status}>"
+        )
+
+
 class PasswordResetToken(db.Model):
     __tablename__ = 'password_reset_tokens'
     id = db.Column(db.Integer, primary_key=True)
@@ -470,6 +534,24 @@ class PaymentTransaction(db.Model):
 
     user = db.relationship("User", back_populates="payments")
     subscription = db.relationship("UserSubscription", back_populates="payments")
+
+# --- Idempotency ledger for App Store Server Notifications V2 ---
+class AppleNotificationEvent(db.Model):
+    """One row per processed Apple notification delivery. notification_uuid
+    is Apple's own retry-safe dedup key (retries of the same event reuse the
+    same UUID); we gate processing on it. transaction_id is recorded too so
+    "was this transaction's event handled" is directly queryable — see
+    apple_notifications.handle_notification()."""
+    __tablename__ = "apple_notification_events"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    notification_uuid = db.Column(db.String(36), nullable=False, unique=True, index=True)
+    notification_type = db.Column(db.String(50), nullable=False)
+    subtype = db.Column(db.String(50))
+    transaction_id = db.Column(db.String(100), index=True)
+    original_transaction_id = db.Column(db.String(100), index=True)
+    signed_date = db.Column(db.DateTime)
+    processed_at = db.Column(db.DateTime, server_default=text("CURRENT_TIMESTAMP"), nullable=False)
 
 # --- For free users ---
 class UserCredits(db.Model):
@@ -728,28 +810,46 @@ class SubscriptionService:
             # fallback, or raise
             end_date = now + relativedelta(months=1)
 
-        # First, see if we already have this exact provider+transaction
+        # Identify the subscription *lineage*, not the individual purchase
+        # event. provider_subscription_id is Apple's original_transaction_id
+        # / Google's linked purchase token lineage — it stays constant across
+        # renewals and even across plan changes (e.g. monthly -> yearly)
+        # within the same subscription group. provider_transaction_id is
+        # unique *per renewal* and must never be used as the row identity,
+        # or every renewal mints a brand new "active" row (see reconcile
+        # investigation, Aug 2026 — user 1 ended up with 14 active rows from
+        # a single sandbox renewal burst).
         existing = None
-        if payment_provider and provider_transaction_id:
+        if payment_provider and provider_subscription_id:
+            existing = UserSubscription.query.filter_by(
+                payment_provider=payment_provider,
+                provider_subscription_id=provider_subscription_id,
+            ).first()
+        if existing is None and payment_provider and provider_transaction_id:
+            # Fall back for providers/rows that never had a subscription-level
+            # id recorded (e.g. older rows, or providers without one).
             existing = UserSubscription.query.filter_by(
                 payment_provider=payment_provider,
                 provider_transaction_id=provider_transaction_id,
             ).first()
 
         if existing:
-            # Idempotent update of an existing subscription row
+            # Idempotent update of an existing subscription row — a renewal,
+            # plan change, or re-verification of the same subscription
+            # lineage, never a new row.
             logger.info(
                 "SubscriptionService._create_subscription: updating existing "
                 f"user_sub id={existing.id} user={user_id} provider={payment_provider} "
-                f"txn={provider_transaction_id}"
+                f"sub_id={provider_subscription_id} txn={provider_transaction_id}"
             )
             existing.plan_id = plan_id
             existing.status = "active"
-            existing.start_date = now
+            existing.start_date = existing.start_date or now
             existing.end_date = end_date
             existing.auto_renew = auto_renew
             existing.payment_method = payment_provider
             existing.provider_subscription_id = provider_subscription_id
+            existing.provider_transaction_id = provider_transaction_id
             existing.receipt_data = receipt_data
             db.session.commit()
             return existing
@@ -785,23 +885,30 @@ class SubscriptionService:
                 "retrying as update: %s",
                 e,
             )
-            # Last-resort: fetch again and update, in case of race
-            if payment_provider and provider_transaction_id:
+            # Last-resort: fetch again and update, in case of race. Same
+            # lineage-first lookup as above.
+            if payment_provider and provider_subscription_id:
+                existing = UserSubscription.query.filter_by(
+                    payment_provider=payment_provider,
+                    provider_subscription_id=provider_subscription_id,
+                ).first()
+            if existing is None and payment_provider and provider_transaction_id:
                 existing = UserSubscription.query.filter_by(
                     payment_provider=payment_provider,
                     provider_transaction_id=provider_transaction_id,
                 ).first()
-                if existing:
-                    existing.plan_id = plan_id
-                    existing.status = "active"
-                    existing.start_date = now
-                    existing.end_date = end_date
-                    existing.auto_renew = auto_renew
-                    existing.payment_method = payment_provider
-                    existing.provider_subscription_id = provider_subscription_id
-                    existing.receipt_data = receipt_data
-                    db.session.commit()
-                    return existing
+            if existing:
+                existing.plan_id = plan_id
+                existing.status = "active"
+                existing.start_date = existing.start_date or now
+                existing.end_date = end_date
+                existing.auto_renew = auto_renew
+                existing.payment_method = payment_provider
+                existing.provider_subscription_id = provider_subscription_id
+                existing.provider_transaction_id = provider_transaction_id
+                existing.receipt_data = receipt_data
+                db.session.commit()
+                return existing
 
             # If we still can't find it, re-raise so you see the error
             raise
@@ -895,22 +1002,96 @@ class SubscriptionService:
         """
         Verify an Apple purchase.
 
-        1. First, try to treat receipt_data as StoreKit 2 transaction JSON
-           (what your Flutter app is actually sending now).
-        2. If that fails, fall back to legacy /verifyReceipt flow which expects
-           base64 app receipt.
+        1a. Preferred: receipt_data is a signed StoreKit2 transaction JWS
+            (serverVerificationData — purchase_service.dart was sending the
+            wrong field, verificationData.localVerificationData, until Aug
+            2026; fixed client-side, this is the server-side half of that
+            fix). Verified cryptographically via apple_notifications'
+            SignedDataVerifier, the same verifier used for Server
+            Notifications V2 — Apple explicitly recommends against
+            hand-rolling this.
+        1b. Compat fallback: plain StoreKit2 JSON (jsonRepresentation) from
+            app versions still on the old client. NOT cryptographically
+            verified — we only reject it if it's expired/revoked according
+            to its own embedded claims (added Aug 2026 after an old, lapsed
+            transaction was replayed by StoreKit and silently granted a
+            fresh billing period). Remove this path once telemetry shows no
+            more "UNVERIFIED StoreKit2 JSON" log lines.
+        2.  Last resort: legacy /verifyReceipt flow, base64 app receipt.
         """
 
-        # --- Path 1: StoreKit 2 transaction JSON from the client ---
+        # --- Path 1a: signed StoreKit2 transaction JWS (preferred) ---
+        if apple_notifications.is_jws(receipt_data):
+            try:
+                tx = apple_notifications.verify_transaction_jws(app, receipt_data)
+            except apple_notifications.AppleNotificationConfig as e:
+                logger.error("Apple verify: JWS path not configured: %s", e)
+                return {"valid": False, "message": "Server not configured to verify Apple receipts"}
+            except AppleVerificationException as e:
+                logger.warning("Apple verify: signed transaction failed verification: status=%s", e.status)
+                return {"valid": False, "message": "Receipt signature verification failed"}
+
+            if tx.revocationDate:
+                logger.warning(
+                    "Apple verify: verified transaction %s has revocationDate=%s, rejecting",
+                    tx.transactionId, tx.revocationDate,
+                )
+                return {"valid": False, "message": "Transaction was refunded/revoked by Apple"}
+
+            expiry_iso = None
+            if tx.expiresDate:
+                expiry_dt = datetime.utcfromtimestamp(tx.expiresDate / 1000.0)
+                expiry_iso = expiry_dt.isoformat() + "Z"
+                if expiry_dt <= datetime.utcnow():
+                    logger.warning(
+                        "Apple verify: verified transaction %s expired at %s, "
+                        "rejecting stale/replayed receipt",
+                        tx.transactionId, expiry_iso,
+                    )
+                    return {"valid": False, "message": f"Transaction expired at {expiry_iso}"}
+
+            logger.info(
+                "Apple verify: cryptographically verified transaction id=%s orig=%s product=%s",
+                tx.transactionId, tx.originalTransactionId, tx.productId,
+            )
+            return {
+                "valid": True,
+                "subscription_id": tx.originalTransactionId,
+                "transaction_id": tx.transactionId,
+                "expiry_date": expiry_iso,
+                "raw": {
+                    "transactionId": tx.transactionId,
+                    "originalTransactionId": tx.originalTransactionId,
+                    "productId": tx.productId,
+                },
+            }
+
+        # --- Path 1b: unsigned StoreKit2 JSON (legacy client compat only) ---
         try:
             tx = json.loads(receipt_data)
             if isinstance(tx, dict) and "transactionId" in tx:
-                logger.info("Apple verify: treating receipt_data as StoreKit2 JSON transaction")
+                logger.warning(
+                    "Apple verify: UNVERIFIED StoreKit2 JSON from client (old app "
+                    "build?) txn=%s — not cryptographically checked, only "
+                    "expiry/revocation-checked", tx.get("transactionId"),
+                )
 
                 transaction_id = tx.get("transactionId")
                 original_transaction_id = (
                     tx.get("originalTransactionId") or transaction_id
                 )
+
+                # Reject refunded/revoked transactions outright.
+                revocation_ms = tx.get("revocationDate")
+                if revocation_ms:
+                    logger.warning(
+                        "Apple verify: transaction %s has revocationDate=%s, rejecting",
+                        transaction_id, revocation_ms,
+                    )
+                    return {
+                        "valid": False,
+                        "message": "Transaction was refunded/revoked by Apple",
+                    }
 
                 # expiresDate is in ms since epoch, optional
                 expires_ms = tx.get("expiresDate")
@@ -918,9 +1099,27 @@ class SubscriptionService:
                 if expires_ms:
                     try:
                         ms = int(expires_ms)
-                        expiry_iso = datetime.utcfromtimestamp(ms / 1000.0).isoformat() + "Z"
+                        expiry_dt = datetime.utcfromtimestamp(ms / 1000.0)
+                        expiry_iso = expiry_dt.isoformat() + "Z"
                     except Exception as e:
                         logger.warning(f"Could not parse expiresDate={expires_ms}: {e}")
+                    else:
+                        # Reject stale/already-lapsed transactions. This is
+                        # what catches StoreKit re-delivering an old,
+                        # unfinished transaction instead of a fresh
+                        # purchase -- the exact failure mode from the Aug
+                        # 2026 incident (transaction expired Jan 2026,
+                        # re-signed and re-sent by the client in Aug 2026).
+                        if expiry_dt <= datetime.utcnow():
+                            logger.warning(
+                                "Apple verify: transaction %s expired at %s, "
+                                "rejecting stale/replayed receipt",
+                                transaction_id, expiry_iso,
+                            )
+                            return {
+                                "valid": False,
+                                "message": f"Transaction expired at {expiry_iso}",
+                            }
 
                 return {
                     "valid": True,
@@ -2684,6 +2883,18 @@ def chat():
         logger.debug("[WARN] Missing dream message.")
         return jsonify({"error": "Missing dream message."}), 400
 
+    # AI-content policy: screen user input before doing any work or burning
+    # credits. Rejected attempts are logged so we can monitor abuse patterns.
+    if moderation.check(message, label="dream_input").flagged:
+        logger.warning(
+            "[MODERATION] dream input rejected user=%s len=%s",
+            current_user.id, len(message),
+        )
+        return jsonify({
+            "error": "content_policy",
+            "message": moderation.INPUT_REJECTED_MESSAGE,
+        }), 400
+
     interp = get_interpreter_for_user(current_user.id, interpreter_id)
 
     logger.debug(f"{current_user.id} - {interpreter_id}")
@@ -2833,6 +3044,20 @@ def chat():
 
         logger.debug(f"[parsed] is_question={is_question} is_nonsense={is_nonsense} tone={tone} summary_present={bool(summary)}")
 
+        # AI-content policy: screen the model's output before returning it
+        # to the user. If anything in `content` is flagged, route through
+        # the existing decline path so the dream is hidden and the user
+        # sees a safe fallback message instead of the raw output.
+        if moderation.check(content, label="dream_analysis_output").flagged:
+            logger.warning(
+                "[MODERATION] analysis output flagged dream=%s user=%s",
+                dream.id, current_user.id,
+            )
+            is_nonsense = True
+            analysis = moderation.OUTPUT_FALLBACK_MESSAGE
+            summary = "Filtered for safety"
+            tone = None
+
         # --- Decline (non-dream / unrelated) ---
         if is_nonsense:
             # Use whatever we parsed; if parsing missed, fall back to whole content
@@ -2920,8 +3145,18 @@ def discuss_dream(dream_id: int):
         return jsonify({"error": "missing text"}), 400
     if len(user_text) > 4000:
         return jsonify({"error": "text too long"}), 413
-    
-        
+
+    # AI-content policy: screen user input before doing any work.
+    if moderation.check(user_text, label="discuss_input").flagged:
+        logger.warning(
+            "[MODERATION] discuss input rejected dream=%s user=%s",
+            dream_id, current_user.id,
+        )
+        return jsonify({
+            "error": "content_policy",
+            "message": moderation.INPUT_REJECTED_MESSAGE,
+        }), 400
+
     interpreter_id = data.get("interpreter_id")
     interp = get_interpreter_for_user(current_user.id, interpreter_id)
 
@@ -2977,12 +3212,20 @@ def discuss_dream(dream_id: int):
 
         content = response.choices[0].message.content.strip()
         logger.debug(f"Dream Analysis Reply: {content}")
-        
+
     except Exception as e:
         # keep the row, but store an error message or leave response NULL
         drow.response = None
         db.session.commit()
         return jsonify({"error": "generation failed"}), 500
+
+    # AI-content policy: screen model output before saving or returning.
+    if moderation.check(content, label="discuss_output").flagged:
+        logger.warning(
+            "[MODERATION] discuss reply flagged dream=%s discuss=%s user=%s",
+            dream.id, drow.id, current_user.id,
+        )
+        content = moderation.OUTPUT_FALLBACK_MESSAGE
 
     drow.response = content
     db.session.commit()
@@ -4971,6 +5214,13 @@ def generate_deep_insights_for_user(user_id, *, force=False):
         logger.error(f"[insights] Invalid JSON from model for user {user_id}: {parsed}")
         return "error", f"invalid_json: {parsed}"
 
+    # AI-content policy: screen the generated narrative before persisting.
+    # We don't save a filtered insight (so the user can retry without
+    # burning a slot) and let the route surface a generic error.
+    if moderation.check(parsed.get("narrative", ""), label="insight_output").flagged:
+        logger.warning("[MODERATION] insight narrative flagged user=%s", user_id)
+        return "error", "content_filtered"
+
     rec = DreamInsight(
         user_id=user_id,
         generated_at=datetime.utcnow(),
@@ -5063,6 +5313,77 @@ def refresh_insights():
         }), 200
     # "error" or unexpected
     return jsonify({"error": "generation_failed", "detail": str(payload)}), 502
+
+
+# =============================================================================
+# AI-Generated Content reporting (Google Play policy compliance)
+# =============================================================================
+#
+# Every AI surface in the app (analysis text, dream image, deep insight,
+# discuss reply) exposes a flag/report affordance that POSTs here. Reports
+# are stored, logged, and (for child-safety) escalated immediately.
+#
+# We pair this reactive flow with proactive moderation via OpenAI's
+# moderation API on both inputs and outputs at each generation site.
+
+ALLOWED_REPORT_TYPES = {"analysis", "image", "insight", "discuss", "other"}
+ALLOWED_REPORT_CATEGORIES = {
+    "sexual", "hate", "violence", "child_safety", "misinfo", "other"
+}
+
+
+@app.route("/api/reports", methods=["POST"])
+@login_required
+def submit_content_report():
+    """Receive a user report flagging AI-generated content."""
+    data = request.get_json(silent=True) or {}
+
+    content_type = (data.get("content_type") or "").strip().lower()
+    category = (data.get("category") or "").strip().lower()
+    content_id = (data.get("content_id") or "").strip() or None
+    comment = (data.get("comment") or "").strip() or None
+    snapshot = (data.get("content_snapshot") or "").strip() or None
+
+    if content_type not in ALLOWED_REPORT_TYPES:
+        return jsonify({"error": "invalid content_type"}), 400
+    if category not in ALLOWED_REPORT_CATEGORIES:
+        return jsonify({"error": "invalid category"}), 400
+    if content_id and len(content_id) > 64:
+        return jsonify({"error": "invalid content_id"}), 400
+    if comment and len(comment) > 500:
+        comment = comment[:500]
+    if snapshot and len(snapshot) > 2048:
+        snapshot = snapshot[:2048]
+
+    report = ContentReport(
+        user_id=current_user.id,
+        content_type=content_type,
+        category=category,
+        content_id=content_id,
+        comment=comment,
+        content_snapshot=snapshot,
+    )
+    db.session.add(report)
+    db.session.commit()
+
+    # Logging: child_safety goes to CRITICAL so it surfaces in any
+    # alerting that's wired up. The rest goes to WARNING for daily review.
+    if category == "child_safety":
+        logger.critical(
+            "[REPORT][CHILD_SAFETY] report_id=%s user=%s type=%s content_id=%s",
+            report.id, current_user.id, content_type, content_id,
+        )
+    else:
+        logger.warning(
+            "[REPORT] report_id=%s user=%s type=%s category=%s content_id=%s",
+            report.id, current_user.id, content_type, category, content_id,
+        )
+
+    # TODO: notify reviewers out-of-band (Slack webhook / email digest /
+    # admin panel). For child_safety, escalate immediately and consider
+    # auto-hiding the content for all users until reviewed.
+
+    return jsonify({"ok": True, "report_id": report.id}), 200
 
 
 if __name__ == "__main__":
