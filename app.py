@@ -1630,6 +1630,7 @@ def api_google_login():
 
                 db.session.commit()
                 user = deleted
+                is_new_user = False
             else:
                 # 3) Truly new user – create fresh
                 user = User(
@@ -1642,6 +1643,7 @@ def api_google_login():
                 db.session.add(user)
                 db.session.commit()
                 _assign_trial(user)
+                is_new_user = True
                 logger.info("✅ Registered new user (Google): %s", email)
 
         else:
@@ -1649,10 +1651,11 @@ def api_google_login():
             if not user.email_confirmed:
                 user.email_confirmed = True
                 db.session.commit()
+            is_new_user = False
 
         # Log them in (whether new, existing, or reactivated)
         login_user(user)
-        return jsonify({"success": True})
+        return jsonify({"success": True, "trial_assigned": is_new_user})
 
     except Exception as e:
         try:
@@ -1716,6 +1719,7 @@ def api_facebook_login():
                 deleted.email_confirmed = True
                 db.session.commit()
                 user = deleted
+                is_new_user = False
             else:
                 # 3) Truly new user
                 user = User(
@@ -1728,14 +1732,16 @@ def api_facebook_login():
                 db.session.add(user)
                 db.session.commit()
                 _assign_trial(user)
+                is_new_user = True
                 logger.info("✅ Registered new user (Facebook): %s", email)
         else:
             if not user.email_confirmed:
                 user.email_confirmed = True
                 db.session.commit()
+            is_new_user = False
 
         login_user(user)
-        return jsonify({"success": True, "user": {"id": user.id}})
+        return jsonify({"success": True, "user": {"id": user.id}, "trial_assigned": is_new_user})
 
     except Exception as e:
         logger.info("facebook login failed: %s", e)
@@ -1940,7 +1946,7 @@ def apple_login():
 
     # 5) Log the user in
     login_user(user)
-    return jsonify({"success": True}), 200
+    return jsonify({"success": True, "trial_assigned": is_new_user}), 200
 
 
 
@@ -2037,7 +2043,8 @@ def register():
         logger.exception("Failed to log in user immediately after registration")
 
     return jsonify({
-        "message": "Please check your email to confirm your Dreamr✨account"
+        "message": "Please check your email to confirm your Dreamr✨account",
+        "trial_assigned": True,
     })
 
 
