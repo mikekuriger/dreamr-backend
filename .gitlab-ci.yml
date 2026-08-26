@@ -42,3 +42,9 @@ deploy_production:
 
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - "*.py"
+        - "**/*.py"
+        - "requirements.txt"
+        - "templates/**/*"
+        - "static/**/*"
