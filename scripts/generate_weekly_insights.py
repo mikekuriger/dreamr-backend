@@ -73,6 +73,10 @@ def _process_user(uid, force, dry_run):
                 return uid, "dry_run", user.email
 
             status, payload = generate_deep_insights_for_user(uid, force=force)
+            if status == "ok":
+                # Snapshot the fields we need now — payload will be a
+                # detached, expired instance the moment this app_context exits.
+                payload = {"id": payload.id, "dream_count": payload.dream_count}
             return uid, status, payload
         except Exception as e:
             LOG.exception(f"Unhandled error for user_id={uid}: {e}")
@@ -120,7 +124,7 @@ def main():
             counts[status] = counts.get(status, 0) + 1
 
             if status == "ok":
-                LOG.info(f"OK user_id={uid} insight_id={payload.id} dreams={payload.dream_count}")
+                LOG.info(f"OK user_id={uid} insight_id={payload['id']} dreams={payload['dream_count']}")
             elif status == "skipped":
                 LOG.info(f"SKIP user_id={uid} {payload}")
             elif status == "locked":
