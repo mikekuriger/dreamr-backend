@@ -431,6 +431,44 @@ class ContentReport(db.Model):
         )
 
 
+class ModerationEvent(db.Model):
+    """Automatic moderation.py rejections, logged for admin review.
+
+    System-initiated counterpart to ContentReport (user-initiated): every
+    time moderation.check() flags input or the model's own output, a row
+    lands here instead of only the rotating log file. Lets us confirm real
+    abuse, spot false positives worth retuning moderation.SCORE_THRESHOLDS
+    for, and — for hard_block rows specifically — know immediately rather
+    than stumbling onto it later. (2026-09-08)
+    """
+    __tablename__ = "moderation_event"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    # Matches moderation.check()'s `label` param: dream_input,
+    # dream_analysis_output, discuss_input, discuss_output, insight_output
+    label = db.Column(db.String(32), nullable=False, index=True)
+    text = db.Column(db.Text, nullable=False)
+    # e.g. ["violence/graphic"] — moderation.ModerationResult.categories
+    categories = db.Column(db.JSON, nullable=False)
+    raw_scores = db.Column(db.JSON, nullable=True)
+    # True iff any flagged category is in moderation.HARD_BLOCK_CATEGORIES
+    # (currently just sexual/minors) — a categorically different, urgent
+    # case from a violence/self-harm threshold hit worth periodic review.
+    hard_block = db.Column(db.Boolean, nullable=False, default=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    # Same review workflow as ContentReport
+    status = db.Column(db.String(16), nullable=False, default="open")
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    action = db.Column(db.String(64), nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<ModerationEvent id={self.id} user_id={self.user_id} "
+            f"label={self.label} categories={self.categories} hard_block={self.hard_block}>"
+        )
+
+
 class PasswordResetToken(db.Model):
     __tablename__ = 'password_reset_tokens'
     id = db.Column(db.Integer, primary_key=True)
@@ -706,28 +744,49 @@ class SubscriptionService:
             if not verification_result.get('valid'):
                 raise ValueError(f"Invalid receipt: {verification_result.get('message')}")
             
-            # Create subscription record
+            txn_id = verification_result.get('transaction_id')
+
+            # Idempotency: has this exact transaction already been recorded?
+            # StoreKit can redeliver the same transaction through multiple
+            # paths (automatic queue redelivery on launch, an explicit
+            # restorePurchases() call, etc.) — without this check each
+            # redelivery mints a brand-new PaymentTransaction row and tells
+            # the client to re-log Meta's Purchase/subscribe events, even
+            # though nothing new actually happened. (2026-09-08)
+            already_recorded = False
+            if payment_provider and txn_id:
+                already_recorded = PaymentTransaction.query.filter_by(
+                    provider=payment_provider,
+                    provider_transaction_id=txn_id,
+                ).first() is not None
+
+            # Create/update subscription record (already idempotent by
+            # provider_subscription_id / provider_transaction_id lineage —
+            # see _create_subscription's own dedup logic)
             subscription = SubscriptionService._create_subscription(
                 user_id=user_id,
                 plan_id=plan_id,
                 payment_provider=payment_provider,
                 provider_subscription_id=verification_result.get('subscription_id'),
-                provider_transaction_id=verification_result.get('transaction_id'),
+                provider_transaction_id=txn_id,
                 receipt_data=receipt_data,
                 auto_renew=True
             )
-            
-            # Create payment record
-            SubscriptionService._create_payment(
-                user_id=user_id,
-                subscription_id=subscription.id,
-                amount=float(plan.price),
-                provider=payment_provider,
-                provider_transaction_id=verification_result.get('transaction_id'),
-                provider_response=verification_result
-            )
-            
-            return {'success': True}
+
+            # Only create a payment record the first time we see this exact
+            # transaction_id — a genuine renewal has its own new txn_id and
+            # still creates one normally.
+            if not already_recorded:
+                SubscriptionService._create_payment(
+                    user_id=user_id,
+                    subscription_id=subscription.id,
+                    amount=float(plan.price),
+                    provider=payment_provider,
+                    provider_transaction_id=txn_id,
+                    provider_response=verification_result
+                )
+
+            return {'success': True, 'already_recorded': already_recorded}
         
         elif payment_provider == 'stripe':
             # For web payments, create a Stripe checkout session
@@ -1463,7 +1522,70 @@ def _get_admin_emails():
 
 def is_admin_user():
     return current_user.is_authenticated and (current_user.email or "").lower() in _get_admin_emails()
-    
+
+
+def _log_moderation_event(user_id, label, text, result):
+    """Persist a flagged moderation.check() result for admin review.
+
+    Called from every moderation.check() call site once `.flagged` is
+    true. Best-effort — a logging failure must never break the actual
+    request, same fail-open philosophy as moderation.check() itself.
+    """
+    hard_block = any(c in moderation.HARD_BLOCK_CATEGORIES for c in result.categories)
+    try:
+        db.session.add(ModerationEvent(
+            user_id=user_id,
+            label=label,
+            text=(text or "")[:8000],
+            categories=result.categories,
+            raw_scores=result.raw_scores,
+            hard_block=hard_block,
+        ))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        logger.exception(
+            "[MODERATION] failed to persist ModerationEvent (label=%s user=%s)",
+            label, user_id,
+        )
+        return
+
+    if hard_block:
+        _send_hard_block_alert(user_id, label, result)
+
+
+def _send_hard_block_alert(user_id, label, result):
+    """Email admins immediately for a HARD_BLOCK_CATEGORIES hit (currently
+    just sexual/minors) — a child-safety matter, not a routine threshold
+    question, and may carry its own legal reporting obligations depending
+    on jurisdiction. Best-effort; never raises.
+    """
+    try:
+        admins = _get_admin_emails()
+        if not admins:
+            logger.error(
+                "[MODERATION] hard_block hit but no ADMIN_EMAILS configured — user=%s label=%s",
+                user_id, label,
+            )
+            return
+        msg = Message(
+            subject=f"[Dreamr] URGENT: moderation hard-block — user {user_id}",
+            recipients=list(admins),
+            body=(
+                "A hard-block moderation category was triggered.\n\n"
+                f"User ID: {user_id}\n"
+                f"Label: {label}\n"
+                f"Categories: {result.categories}\n\n"
+                "Review in the admin panel: /admin/moderation\n"
+            )
+        )
+        mail.send(msg)
+    except Exception:
+        logger.exception(
+            "[MODERATION] failed to send hard_block alert email (user=%s label=%s)",
+            user_id, label,
+        )
+
 
 def admin_required(fn):
     from functools import wraps
@@ -2897,11 +3019,13 @@ def chat():
 
     # AI-content policy: screen user input before doing any work or burning
     # credits. Rejected attempts are logged so we can monitor abuse patterns.
-    if moderation.check(message, label="dream_input").flagged:
+    _mod_result = moderation.check(message, label="dream_input")
+    if _mod_result.flagged:
         logger.warning(
             "[MODERATION] dream input rejected user=%s len=%s",
             current_user.id, len(message),
         )
+        _log_moderation_event(current_user.id, "dream_input", message, _mod_result)
         return jsonify({
             "error": "content_policy",
             "message": moderation.INPUT_REJECTED_MESSAGE,
@@ -3060,11 +3184,13 @@ def chat():
         # to the user. If anything in `content` is flagged, route through
         # the existing decline path so the dream is hidden and the user
         # sees a safe fallback message instead of the raw output.
-        if moderation.check(content, label="dream_analysis_output").flagged:
+        _mod_result = moderation.check(content, label="dream_analysis_output")
+        if _mod_result.flagged:
             logger.warning(
                 "[MODERATION] analysis output flagged dream=%s user=%s",
                 dream.id, current_user.id,
             )
+            _log_moderation_event(current_user.id, "dream_analysis_output", content, _mod_result)
             is_nonsense = True
             analysis = moderation.OUTPUT_FALLBACK_MESSAGE
             summary = "Filtered for safety"
@@ -3159,11 +3285,13 @@ def discuss_dream(dream_id: int):
         return jsonify({"error": "text too long"}), 413
 
     # AI-content policy: screen user input before doing any work.
-    if moderation.check(user_text, label="discuss_input").flagged:
+    _mod_result = moderation.check(user_text, label="discuss_input")
+    if _mod_result.flagged:
         logger.warning(
             "[MODERATION] discuss input rejected dream=%s user=%s",
             dream_id, current_user.id,
         )
+        _log_moderation_event(current_user.id, "discuss_input", user_text, _mod_result)
         return jsonify({
             "error": "content_policy",
             "message": moderation.INPUT_REJECTED_MESSAGE,
@@ -3232,11 +3360,13 @@ def discuss_dream(dream_id: int):
         return jsonify({"error": "generation failed"}), 500
 
     # AI-content policy: screen model output before saving or returning.
-    if moderation.check(content, label="discuss_output").flagged:
+    _mod_result = moderation.check(content, label="discuss_output")
+    if _mod_result.flagged:
         logger.warning(
             "[MODERATION] discuss reply flagged dream=%s discuss=%s user=%s",
             dream.id, drow.id, current_user.id,
         )
+        _log_moderation_event(current_user.id, "discuss_output", content, _mod_result)
         content = moderation.OUTPUT_FALLBACK_MESSAGE
 
     drow.response = content
@@ -4364,6 +4494,7 @@ ADMIN_SHELL = """<!doctype html><meta charset="utf-8">
       <a href="/admin/">Dashboard</a>
       <a href="/admin/users">Users</a>
       <a href="/admin/credit-packs">Credit Packs</a>
+      <a href="/admin/moderation">Moderation</a>
       <a href="/admin/logout" onclick="event.preventDefault();document.getElementById('al').submit()" style="margin-left:auto">Logout</a>
     </div>
   </nav>
@@ -4478,6 +4609,101 @@ def admin_toggle_credit_pack(pack_id: str):
     pack.is_enabled = not pack.is_enabled
     db.session.commit()
     return redirect("/admin/credit-packs")
+
+
+@app.get("/admin/moderation")
+@admin_required
+def admin_moderation_list():
+    try: page = max(1, int(request.args.get("page", 1)))
+    except: page = 1
+    try: per_page = min(200, max(1, int(request.args.get("per_page", 50))))
+    except: per_page = 50
+    label_filter = (request.args.get("label") or "").strip()
+    status_filter = (request.args.get("status") or "").strip()
+    hard_block_only = request.args.get("hard_block") == "1"
+
+    qry = ModerationEvent.query
+    if label_filter:
+        qry = qry.filter(ModerationEvent.label == label_filter)
+    if status_filter:
+        qry = qry.filter(ModerationEvent.status == status_filter)
+    if hard_block_only:
+        qry = qry.filter(ModerationEvent.hard_block.is_(True))
+
+    qry = qry.order_by(desc(ModerationEvent.created_at))
+    total = qry.count()
+    events = qry.offset((page - 1) * per_page).limit(per_page).all()
+
+    BODY = """
+    <h2>Moderation Events</h2>
+    <div style="display:flex;gap:12px;margin:16px 0">
+      <div class="msg">Total matching: <b>{{ total }}</b></div>
+    </div>
+    <form method="get" style="display:flex;gap:12px;align-items:flex-end">
+      <div><label>Label</label>
+        <select name="label">
+          <option value="">All</option>
+          {% for l in ['dream_input','dream_analysis_output','discuss_input','discuss_output','insight_output'] %}
+          <option value="{{ l }}" {{ 'selected' if l == label_filter else '' }}>{{ l }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div><label>Status</label>
+        <select name="status">
+          <option value="">All</option>
+          {% for s in ['open','reviewing','actioned','dismissed'] %}
+          <option value="{{ s }}" {{ 'selected' if s == status_filter else '' }}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div><label style="display:inline-flex;align-items:center;gap:6px"><input type="checkbox" name="hard_block" value="1" {{ 'checked' if hard_block_only else '' }} style="width:auto"> Hard-block only</label></div>
+      <button type="submit">Filter</button>
+    </form>
+
+    <table>
+      <tr><th>ID</th><th>User</th><th>Label</th><th>Categories</th><th>Text</th><th>Status</th><th>When</th><th>Set status</th></tr>
+      {% for e in events %}
+      <tr style="{{ 'background:#f8d7da' if e.hard_block else '' }}">
+        <td>{{ e.id }}</td>
+        <td><a href="{{ url_for('admin_user_detail', user_id=e.user_id) }}">#{{ e.user_id }}</a></td>
+        <td>{{ e.label }}{% if e.hard_block %}<br><b>HARD BLOCK</b>{% endif %}</td>
+        <td>{{ e.categories|join(', ') }}</td>
+        <td class="text-cell">{{ e.text[:300] }}{{ '…' if e.text|length > 300 else '' }}</td>
+        <td>{{ e.status }}</td>
+        <td>{{ e.created_at.strftime('%Y-%m-%d %H:%M') if e.created_at else '' }}</td>
+        <td>
+          <form method="post" action="{{ url_for('admin_moderation_update', event_id=e.id) }}" class="inline">
+            <select name="status" onchange="this.form.submit()">
+              {% for s in ['open','reviewing','actioned','dismissed'] %}
+              <option value="{{ s }}" {{ 'selected' if s == e.status else '' }}>{{ s }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <div class="pagination">
+      {% if page > 1 %}<a href="?page={{ page-1 }}&label={{ label_filter }}&status={{ status_filter }}&hard_block={{ '1' if hard_block_only else '' }}">← Prev</a>{% endif %}
+      <span>Page {{ page }}</span>
+      {% if events|length == per_page %}<a href="?page={{ page+1 }}&label={{ label_filter }}&status={{ status_filter }}&hard_block={{ '1' if hard_block_only else '' }}">Next →</a>{% endif %}
+    </div>
+    """
+    return _render_admin(BODY, "Moderation", total=total, events=events, page=page, per_page=per_page,
+                         label_filter=label_filter, status_filter=status_filter, hard_block_only=hard_block_only)
+
+
+@app.post("/admin/moderation/<int:event_id>/status")
+@admin_required
+def admin_moderation_update(event_id: int):
+    event = ModerationEvent.query.get_or_404(event_id)
+    new_status = (request.form.get("status") or "").strip()
+    if new_status in ("open", "reviewing", "actioned", "dismissed"):
+        event.status = new_status
+        event.reviewed_at = datetime.utcnow()
+        db.session.commit()
+    return redirect(request.referrer or "/admin/moderation")
 
 
 # ----- Admin pages -----
@@ -5229,8 +5455,10 @@ def generate_deep_insights_for_user(user_id, *, force=False):
     # AI-content policy: screen the generated narrative before persisting.
     # We don't save a filtered insight (so the user can retry without
     # burning a slot) and let the route surface a generic error.
-    if moderation.check(parsed.get("narrative", ""), label="insight_output").flagged:
+    _mod_result = moderation.check(parsed.get("narrative", ""), label="insight_output")
+    if _mod_result.flagged:
         logger.warning("[MODERATION] insight narrative flagged user=%s", user_id)
+        _log_moderation_event(user_id, "insight_output", parsed.get("narrative", ""), _mod_result)
         return "error", "content_filtered"
 
     rec = DreamInsight(

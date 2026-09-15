@@ -56,8 +56,16 @@ HARD_BLOCK_CATEGORIES = {
 # Thresholds tuned conservatively — OpenAI's default `flagged` field is
 # often too permissive for child-safety surfaces but too aggressive for
 # a dream journal where users describe fights, fear, falling, etc.
+#
+# "sexual" deliberately has no threshold here (2026-09-10): explicit adult
+# sexual dream content isn't something this app filters — dreams about sex
+# are extremely common and not illegal or harmful to journal privately.
+# sexual/minors above is the only sexual-content gate; it's a hard block
+# regardless of score. Real calibration data before this change: plain,
+# non-graphic statements ("I had sex with someone") scored 0.92-0.93 on
+# `sexual` alone, which would have blocked completely ordinary dream
+# content under the old 0.85 threshold.
 SCORE_THRESHOLDS: Dict[str, float] = {
-    "sexual": 0.85,
     "hate": 0.85,
     "hate/threatening": 0.6,
     "harassment": 0.9,
