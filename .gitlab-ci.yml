@@ -48,3 +48,44 @@ deploy_production:
         - "requirements.txt"
         - "templates/**/*"
         - "static/**/*"
+
+# Deploys to the Terraform-managed AWS test/learning instances
+# (dreamr_tf repo). Separate SSH key, separate variables, entirely
+# independent of deploy_production above — never auto-runs, and
+# a failure here can't affect the real prod deploy.
+#
+# Requires these CI/CD variables (Settings > CI/CD > Variables),
+# distinct from the deploy_production ones:
+#   TEST_SSH_PRIVATE_KEY  - file, masked/protected: contents of
+#                            dreamr_tf/.ci-keys/gitlab_ci_deploy_key
+#   TEST_DEPLOY_USER      - value: mikekuriger
+#   TEST_DEPLOY_HOSTS      - value: space-separated FQDNs of every
+#                            "app"/"combined" node in the CURRENT
+#                            topology (see `terraform output
+#                            ssh_commands` in dreamr_tf) — update this
+#                            whenever you switch topologies and re-apply
+deploy_test:
+  stage: deploy
+  image: alpine:latest
+  when: manual
+
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval "$(ssh-agent -s)"
+    - chmod 400 "$TEST_SSH_PRIVATE_KEY"
+    - ssh-add "$TEST_SSH_PRIVATE_KEY"
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - for HOST in $TEST_DEPLOY_HOSTS; do ssh-keyscan -H "$HOST" >>~/.ssh/known_hosts 2>/dev/null; done
+    - chmod 644 ~/.ssh/known_hosts
+
+  script:
+    - |
+      for HOST in $TEST_DEPLOY_HOSTS; do
+        echo "== deploying to $HOST =="
+        ssh "$TEST_DEPLOY_USER@$HOST" /usr/local/sbin/deploy-dreamr
+      done
+
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
