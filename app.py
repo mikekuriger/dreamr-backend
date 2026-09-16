@@ -92,7 +92,10 @@ mail = Mail(app)
 # new users will also be hashed and compared to list of hashes for a match
 # if a match is found, user will get their credits restored
 # this is to prevent abuse from users deleting and creating new accounts to get free credits
-SECRET_PEPPER = "mikekuriger@gmail.com".encode("utf-8")
+# Value lives in config.py (untracked, per-environment), not in source -
+# changing it orphans every already-hashed row, since the plaintext email
+# behind an existing hash is gone forever and can't be re-hashed.
+SECRET_PEPPER = app.config.get("SECRET_PEPPER", "mikekuriger@gmail.com").encode("utf-8")
 def hash_string_secret(value: str) -> str:
     return hmac.new(SECRET_PEPPER, value.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -2001,13 +2004,18 @@ def apple_login():
     if apple_user_id:
         user = User.query.filter_by(apple_user_id=apple_user_id).first()
 
-        # If this user has a hashed email matching current email, restore it
+        # apple_user_id is a stable per-app identifier that never changes,
+        # even if Apple rotates the user's private-relay email address (this
+        # happens when the user disconnects "Sign in with Apple" for this
+        # app and reconnects later, e.g. around account deletion). So if we
+        # matched on apple_user_id, trust it and sync the email unconditionally
+        # instead of only when it matches the stored hash - otherwise a
+        # reactivated/rotated-relay account would stay stuck with its old
+        # hashed email forever.
         if user and email:
-            email_hash = hash_string_secret(email)
-            if user.email == email_hash:
-                user.email = email
-                user.first_name = first_name or user.first_name
-                user.email_confirmed = True
+            user.email = email
+            user.first_name = first_name or user.first_name
+            user.email_confirmed = True
 
     # 2) If no user yet, try by real email (case-insensitive)
     if not user and email:
@@ -2567,8 +2575,11 @@ def delete_account():
         user.enable_audio = False
         user.email_confirmed = False
 
-        # Sever any social login links so they can't be used to log in again
-        user.apple_user_id = None
+        # Deliberately keep apple_user_id: it's the only stable anchor that
+        # still identifies this Apple account if the private-relay email
+        # rotates on reconnect (see api_apple_login's reactivation flow).
+        # Not PII on its own, and the password below is cleared so it can't
+        # be used to log in.
 
         # Make password unusable
         user.password = ""
